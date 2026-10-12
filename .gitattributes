@@ -1,0 +1,6 @@
+# Les scripts shell doivent toujours garder des fins de ligne LF, meme
+# clones/commites depuis Windows -- un CRLF dans entrypoint.sh casse son
+# execution dans le conteneur Linux (#!/bin/bash suivi de \r).
+*.sh text eol=lf
+Dockerfile text eol=lf
+*.py text eol=lf

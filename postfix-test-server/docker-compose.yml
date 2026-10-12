@@ -1,0 +1,19 @@
+services:
+  postfix-lab:
+    build: .
+    container_name: dica-mx-lab
+    hostname: mail.labdomain.test
+    restart: unless-stopped
+    ports:
+      - "25:25"
+    environment:
+      MAIL_DOMAIN: ${MAIL_DOMAIN:-labdomain.test}
+      TEST_USER: ${TEST_USER:-test}
+      OPEN_RELAY: ${OPEN_RELAY:-false}
+    volumes:
+      - maildata:/var/mail
+      - maillogs:/var/log
+
+volumes:
+  maildata:
+  maillogs:

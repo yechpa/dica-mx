@@ -1,0 +1,16 @@
+# Rapports/logs generes par bdika_mx.py (contiennent les resultats de tests
+# reels par client -- ne doivent pas finir dans l'historique git)
+dica_mx_reports/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / config locale
+postfix-test-server/.env
+
+# OS / editeurs
+.DS_Store
+Thumbs.db
