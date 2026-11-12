@@ -80,6 +80,51 @@ if (-not $MxHost -or -not $MxIp) {
 }
 Write-Host "[i] MX selected: $MxHost -> $MxIp`n" -ForegroundColor Cyan
 
+# --------------------------------------------------------------------
+# DNS posture check (SPF/DMARC) - passive, read-only, no SMTP connection.
+# Context for interpreting the active tests below: a tested domain's own
+# DMARC policy explains why unauthenticated/self-impersonation is blocked
+# or not, and the spoofed domain's own DMARC policy sets the bar for what
+# a compliant receiving gateway should do with the spoofing test (p=reject
+# should SMTP-reject; p=quarantine should accept then filter downstream;
+# p=none means no expectation either way).
+# --------------------------------------------------------------------
+function Get-SpfRecord($LookupDomain) {
+    try {
+        $txts = Resolve-DnsName -Name $LookupDomain -Type TXT -ErrorAction Stop
+        $spf = $txts | Where-Object { ($_.Strings -join '') -match '^v=spf1' } | Select-Object -First 1
+        if ($spf) { return ($spf.Strings -join '') }
+    } catch { }
+    return $null
+}
+
+function Get-DmarcRecord($LookupDomain) {
+    try {
+        $txts = Resolve-DnsName -Name "_dmarc.$LookupDomain" -Type TXT -ErrorAction Stop
+        $dmarc = $txts | Where-Object { ($_.Strings -join '') -match '^v=DMARC1' } | Select-Object -First 1
+        if ($dmarc) { return ($dmarc.Strings -join '') }
+    } catch { }
+    return $null
+}
+
+$spoofDomain = ($SpoofFrom -split '@')[-1]
+
+Write-Host "--- DNS posture check (SPF/DMARC) ---" -ForegroundColor Cyan
+$clientSpf    = Get-SpfRecord $Domain
+$clientDmarc  = Get-DmarcRecord $Domain
+Write-Host "  $Domain SPF    : $(if ($clientSpf) { $clientSpf } else { '(none found)' })"
+Write-Host "  $Domain DMARC  : $(if ($clientDmarc) { $clientDmarc } else { '(none found)' })"
+
+$spoofSpf   = Get-SpfRecord $spoofDomain
+$spoofDmarc = Get-DmarcRecord $spoofDomain
+Write-Host "  $spoofDomain SPF    : $(if ($spoofSpf) { $spoofSpf } else { '(none found)' })"
+Write-Host "  $spoofDomain DMARC  : $(if ($spoofDmarc) { $spoofDmarc } else { '(none found)' })`n"
+
+$dnsPosture = [PSCustomObject]@{
+    ClientDomain = $Domain; ClientSpf = $clientSpf; ClientDmarc = $clientDmarc
+    SpoofDomain  = $spoofDomain; SpoofSpf = $spoofSpf; SpoofDmarc = $spoofDmarc
+}
+
 Write-Host "--- Summary ---"
 Write-Host "  Domain          : $Domain"
 Write-Host "  Internal mailbox: $InternalEmail"
@@ -237,14 +282,22 @@ $slug = $Domain -replace '\.', '_'
 $logPath = Join-Path $outDir "$slug`_$stamp`_log.json"
 $reportPath = Join-Path $outDir "$slug`_$stamp`_report.txt"
 
-$results | Select-Object Key, Title, MailFrom, RcptTo, FinalCode, Verdict, @{N='Transcript';E={$_.Transcript}} |
-    ConvertTo-Json -Depth 4 | Set-Content -Path $logPath -Encoding UTF8
+[PSCustomObject]@{
+    DnsPosture = $dnsPosture
+    Tests = ($results | Select-Object Key, Title, MailFrom, RcptTo, FinalCode, Verdict, @{N='Transcript';E={$_.Transcript}})
+} | ConvertTo-Json -Depth 5 | Set-Content -Path $logPath -Encoding UTF8
 
 $reportLines = @()
 $reportLines += "Subject: MX Server Test Summary - $Domain - $(Get-Date -Format 'dd/MM/yyyy')"
 $reportLines += ""
 $reportLines += "Domain tested: $Domain"
 $reportLines += "MX tested: $MxHost ($MxIp)"
+$reportLines += ""
+$reportLines += "--- DNS posture check (SPF/DMARC) ---"
+$reportLines += "$Domain SPF: $(if ($clientSpf) { $clientSpf } else { '(none found)' })"
+$reportLines += "$Domain DMARC: $(if ($clientDmarc) { $clientDmarc } else { '(none found)' })"
+$reportLines += "$spoofDomain SPF: $(if ($spoofSpf) { $spoofSpf } else { '(none found)' })"
+$reportLines += "$spoofDomain DMARC: $(if ($spoofDmarc) { $spoofDmarc } else { '(none found)' })"
 $reportLines += ""
 foreach ($r in $results) {
     $reportLines += "--- $($r.Title) ---"
