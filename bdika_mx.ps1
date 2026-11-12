@@ -241,6 +241,26 @@ $reportPath = Join-Path $outDir "$slug`_$stamp`_rapport.txt"
 $results | Select-Object Key, Title, MailFrom, RcptTo, FinalCode, Verdict, @{N='Transcript';E={$_.Transcript}} |
     ConvertTo-Json -Depth 4 | Set-Content -Path $logPath -Encoding UTF8
 
+# Le rapport client est toujours en anglais (destinataires israeliens,
+# le francais ne sert qu'en interne) -- titres et verdicts retraduits ici,
+# independamment des messages console ci-dessus.
+$englishTitle = @{
+    "unauth" = "Unauthenticated send test"
+    "spoof"  = "Spoofing test"
+    "relay"  = "Open mail relay test"
+}
+
+function Get-EnglishVerdict($r) {
+    if ($null -eq $r.FinalCode) { return "NOT RUN" }
+    if ($r.FinalCode -eq -1) { return "NETWORK ERROR" }
+    if ($r.Key -eq "relay") {
+        if ($r.FinalCode -ge 400) { return "OK - relay refused (code $($r.FinalCode), good sign)" }
+        return "RISK - relay accepted (code $($r.FinalCode))"
+    }
+    if ($r.FinalCode -lt 300) { return "RISK - message accepted (code $($r.FinalCode))" }
+    return "OK - message rejected (code $($r.FinalCode))"
+}
+
 $reportLines = @()
 $reportLines += "Subject: MX Server Test Summary - $Domain - $(Get-Date -Format 'dd/MM/yyyy')"
 $reportLines += ""
@@ -248,8 +268,9 @@ $reportLines += "Domain tested: $Domain"
 $reportLines += "MX tested: $MxHost ($MxIp)"
 $reportLines += ""
 foreach ($r in $results) {
-    $reportLines += "--- $($r.Title) ---"
-    $reportLines += "Result: $($r.Verdict)"
+    $title = if ($englishTitle.ContainsKey($r.Key)) { $englishTitle[$r.Key] } else { $r.Title }
+    $reportLines += "--- $title ---"
+    $reportLines += "Result: $(Get-EnglishVerdict $r)"
     $reportLines += ""
 }
 $reportLines -join "`n" | Set-Content -Path $reportPath -Encoding UTF8
