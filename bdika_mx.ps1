@@ -1,17 +1,16 @@
 <#
 .SYNOPSIS
-    Outil DICA MX (PowerShell) - version sans dependance, pour machine
-    sans Python ni acces Internet pour pip (juste le port 25 sortant vers
-    le MX du client, comme telnet).
+    DICA MX tool (PowerShell) - dependency-free version, for machines
+    without Python or internet access for pip (just needs outbound port
+    25 to the client's MX, same as telnet).
 
 .DESCRIPTION
-    Automatise les 3 tests SMTP bruts de la procedure DICA MX :
-    non authentifie, usurpation (spoofing), relais ouvert.
-    Resout le MX via Resolve-DnsName si disponible, sinon demande l'IP
-    manuellement (ex: deja recuperee via dnsdumpster/export .xlsx).
+    Automates the 3 raw SMTP tests of the DICA MX procedure: unauthenticated
+    send, spoofing, open mail relay. Resolves the MX via Resolve-DnsName
+    when available, otherwise asks for the IP manually (e.g. already
+    gathered via dnsdumpster / an .xlsx export).
 
-    USAGE RESERVE a des tests autorises, dans le cadre d'un mandat client
-    signe.
+    AUTHORIZED USE ONLY - as part of a signed client mandate.
 
 .EXAMPLE
     .\bdika_mx.ps1
@@ -37,7 +36,7 @@ function Read-Prompt($Message, $Default = $null, [switch]$Required) {
         $val = Read-Host "$Message$suffix"
         if ([string]::IsNullOrWhiteSpace($val)) {
             if ($Default) { return $Default }
-            if ($Required) { Write-Host "    -> requis, merci de saisir une valeur." -ForegroundColor Yellow; continue }
+            if ($Required) { Write-Host "    -> required, please enter a value." -ForegroundColor Yellow; continue }
             return $null
         }
         return $val.Trim()
@@ -45,27 +44,27 @@ function Read-Prompt($Message, $Default = $null, [switch]$Required) {
 }
 
 # --------------------------------------------------------------------
-# Mode interactif si pas de domaine fourni en parametre
+# Interactive mode when no domain is passed as a parameter
 # --------------------------------------------------------------------
 if (-not $Domain) {
-    Write-Host "`n=== Assistant interactif - DICA MX (PowerShell) ===" -ForegroundColor Cyan
-    Write-Host "(Entree sans rien taper = valeur par defaut entre [ ], ou saute le test)`n"
+    Write-Host "`n=== DICA MX interactive assistant (PowerShell) ===" -ForegroundColor Cyan
+    Write-Host "(Press Enter to accept the default in [ ], or to skip a test)`n"
 
-    $Domain         = Read-Prompt "Domaine du client a tester (ex: client-domaine.com)" -Required
-    $InternalEmail  = Read-Prompt "Adresse interne de controle sur $Domain" -Required
-    $RelayTestEmail = Read-Prompt "Boite externe pour le test de relais (Entree = sauter ce test)"
-    $SpoofFrom      = Read-Prompt "Adresse externe usurpee pour le spoofing" -Default $SpoofFrom
-    $MxIp           = Read-Prompt "IP du MX (Entree = tenter un lookup DNS automatique)"
+    $Domain         = Read-Prompt "Client domain to test (e.g. client-domain.com)" -Required
+    $InternalEmail  = Read-Prompt "Internal control address on $Domain" -Required
+    $RelayTestEmail = Read-Prompt "External mailbox for the relay test (Enter = skip this test)"
+    $SpoofFrom      = Read-Prompt "External address to spoof" -Default $SpoofFrom
+    $MxIp           = Read-Prompt "MX IP (Enter = try an automatic DNS lookup)"
     if ($MxIp) {
-        $MxHost = Read-Prompt "Hostname MX correspondant (pour le HELO)" -Default $Domain
+        $MxHost = Read-Prompt "Matching MX hostname (for HELO)" -Default $Domain
     }
 }
 
 if (-not $MxHost -or -not $MxIp) {
-    Write-Host "[i] Lookup MX pour $Domain ..." -ForegroundColor Cyan
+    Write-Host "[i] Looking up MX for $Domain ..." -ForegroundColor Cyan
     try {
         $records = Resolve-DnsName -Name $Domain -Type MX -ErrorAction Stop | Sort-Object Preference
-        foreach ($r in $records) { Write-Host ("    priorite {0,3}  {1}" -f $r.Preference, $r.NameExchange) }
+        foreach ($r in $records) { Write-Host ("    priority {0,3}  {1}" -f $r.Preference, $r.NameExchange) }
         $best = $records | Select-Object -First 1
         if (-not $MxHost) { $MxHost = $best.NameExchange.TrimEnd('.') }
         if (-not $MxIp) {
@@ -73,31 +72,31 @@ if (-not $MxHost -or -not $MxIp) {
             $MxIp = $a.IPAddress
         }
     } catch {
-        Write-Host "[!] Lookup DNS automatique impossible ($($_.Exception.Message))." -ForegroundColor Yellow
-        Write-Host "    Entre l'IP et le hostname du MX manuellement (ex: via l'export dnsdumpster)."
-        if (-not $MxIp)   { $MxIp   = Read-Prompt "IP du MX" -Required }
-        if (-not $MxHost) { $MxHost = Read-Prompt "Hostname MX (pour HELO)" -Default $Domain }
+        Write-Host "[!] Automatic DNS lookup failed ($($_.Exception.Message))." -ForegroundColor Yellow
+        Write-Host "    Enter the MX IP and hostname manually (e.g. from a dnsdumpster export)."
+        if (-not $MxIp)   { $MxIp   = Read-Prompt "MX IP" -Required }
+        if (-not $MxHost) { $MxHost = Read-Prompt "MX hostname (for HELO)" -Default $Domain }
     }
 }
-Write-Host "[i] MX retenu : $MxHost -> $MxIp`n" -ForegroundColor Cyan
+Write-Host "[i] MX selected: $MxHost -> $MxIp`n" -ForegroundColor Cyan
 
-Write-Host "--- Recapitulatif ---"
-Write-Host "  Domaine        : $Domain"
-Write-Host "  Boite interne  : $InternalEmail"
-Write-Host "  Test relais    : $(if ($RelayTestEmail) { $RelayTestEmail } else { '(saute)' })"
-Write-Host "  Spoof From     : $SpoofFrom"
-Write-Host "  MX             : $MxHost ($MxIp)`n"
+Write-Host "--- Summary ---"
+Write-Host "  Domain          : $Domain"
+Write-Host "  Internal mailbox: $InternalEmail"
+Write-Host "  Relay test      : $(if ($RelayTestEmail) { $RelayTestEmail } else { '(skipped)' })"
+Write-Host "  Spoof From      : $SpoofFrom"
+Write-Host "  MX              : $MxHost ($MxIp)`n"
 
 if (-not $ConfirmAuthorized) {
-    $ans = Read-Host "Confirmes-tu disposer d'un mandat client signe autorisant ce test ? (taper 'oui' pour continuer)"
-    if ($ans.Trim().ToLower() -notin @("oui", "yes", "y")) {
-        Write-Host "Annule." -ForegroundColor Yellow
+    $ans = Read-Host "Do you confirm you have a signed client mandate authorizing this test? (type 'yes' to continue)"
+    if ($ans.Trim().ToLower() -notin @("yes", "y", "oui")) {
+        Write-Host "Cancelled." -ForegroundColor Yellow
         exit 1
     }
 }
 
 # --------------------------------------------------------------------
-# Transaction SMTP brute sur socket TCP (pas de module externe requis)
+# Raw SMTP transaction over a TCP socket (no external module required)
 # --------------------------------------------------------------------
 function Invoke-SmtpTest {
     param(
@@ -111,8 +110,8 @@ function Invoke-SmtpTest {
     $finalCode = $null
 
     function Read-SmtpLine($reader) {
-        # Une reponse SMTP peut etre multi-ligne ("250-..." puis "250 ...") ;
-        # on lit jusqu'a la ligne finale (4e caractere = espace, pas '-').
+        # An SMTP response can span multiple lines ("250-..." then "250 ...");
+        # keep reading until the final line (4th character is a space, not '-').
         $last = $null
         do {
             $last = $reader.ReadLine()
@@ -137,7 +136,7 @@ function Invoke-SmtpTest {
         $finalCode = [int]($greeting.Substring(0,3))
         if ($finalCode -ge 400) { throw "stop" }
 
-        $writer.WriteLine("HELO $MxHost".Replace($MxHost, $Domain))  # HELO <notre domaine>, pas celui du MX
+        $writer.WriteLine("HELO $Domain")
         $resp = Read-SmtpLine $reader
         $transcript.Add("HELO $Domain -> $resp")
         $finalCode = [int]($resp.Substring(0,3))
@@ -169,25 +168,25 @@ $Body
 "@
         foreach ($line in ($msg -split "`n")) { $writer.WriteLine($line.TrimEnd("`r")) }
         $resp = Read-SmtpLine $reader
-        $transcript.Add("DATA + corps du message -> $resp")
+        $transcript.Add("DATA + message body -> $resp")
         $finalCode = [int]($resp.Substring(0,3))
 
         $writer.WriteLine("QUIT")
         $client.Close()
     } catch {
         if ($_.Exception.Message -ne "stop") {
-            $transcript.Add("ERREUR RESEAU -> $($_.Exception.Message)")
+            $transcript.Add("NETWORK ERROR -> $($_.Exception.Message)")
             $finalCode = -1
         }
     }
 
     $verdict = switch ($true) {
-        ($null -eq $finalCode) { "NON EXECUTE"; break }
-        ($finalCode -eq -1) { "ERREUR RESEAU"; break }
-        ($Key -eq "relay" -and $finalCode -ge 400) { "OK - relais refuse (code $finalCode, bon signe)"; break }
-        ($Key -eq "relay") { "RISQUE - relais accepte (code $finalCode)"; break }
-        ($finalCode -lt 300) { "RISQUE - message accepte (code $finalCode)"; break }
-        default { "OK - message refuse (code $finalCode)" }
+        ($null -eq $finalCode) { "NOT RUN"; break }
+        ($finalCode -eq -1) { "NETWORK ERROR"; break }
+        ($Key -eq "relay" -and $finalCode -ge 400) { "OK - relay refused (code $finalCode, good sign)"; break }
+        ($Key -eq "relay") { "RISK - relay accepted (code $finalCode)"; break }
+        ($finalCode -lt 300) { "RISK - message accepted (code $finalCode)"; break }
+        default { "OK - message rejected (code $finalCode)" }
     }
 
     return [PSCustomObject]@{
@@ -196,20 +195,20 @@ $Body
     }
 }
 
-$disclaimer = "Bonjour,`n`nCeci est un test realise par Integrity. Si vous recevez cet email, merci de nous renvoyer une capture d'ecran (et de preciser s'il est arrive en boite de reception, indesirables ou spam).`n`nMerci."
+$disclaimer = "Hello,`n`nThis is a test performed by Integrity. If you receive this email, please send us a screenshot (and let us know whether it landed in your inbox, junk, or spam folder).`n`nThank you."
 
 $results = @()
 
-Write-Host "--- Test non authentifie ---" -ForegroundColor Cyan
-$r = Invoke-SmtpTest -Key "unauth" -Title "Test non authentifie" `
+Write-Host "--- Unauthenticated send test ---" -ForegroundColor Cyan
+$r = Invoke-SmtpTest -Key "unauth" -Title "Unauthenticated send test" `
         -MailFrom $InternalEmail -RcptTo $InternalEmail `
         -Subject "Integrity Unauthenticated Test" -Body $disclaimer
 $r.Transcript | ForEach-Object { Write-Host "    $_" }
 Write-Host "    => $($r.Verdict)`n"
 $results += $r
 
-Write-Host "--- Test d'usurpation (spoofing) ---" -ForegroundColor Cyan
-$r = Invoke-SmtpTest -Key "spoof" -Title "Test d'usurpation (spoofing)" `
+Write-Host "--- Spoofing test ---" -ForegroundColor Cyan
+$r = Invoke-SmtpTest -Key "spoof" -Title "Spoofing test" `
         -MailFrom $SpoofFrom -RcptTo $InternalEmail `
         -Subject "Integrity Spoofing Test" -Body $disclaimer
 $r.Transcript | ForEach-Object { Write-Host "    $_" }
@@ -217,9 +216,9 @@ Write-Host "    => $($r.Verdict)`n"
 $results += $r
 
 if ($RelayTestEmail) {
-    Write-Host "--- Test de relais ouvert (mail relay) ---" -ForegroundColor Cyan
-    $relayBody = "Bonjour,`n`nCeci est un test realise par Integrity. Si vous recevez cet email, le MX teste peut etre utilise comme relais de courrier.`n`nMerci."
-    $r = Invoke-SmtpTest -Key "relay" -Title "Test de relais ouvert (mail relay)" `
+    Write-Host "--- Open mail relay test ---" -ForegroundColor Cyan
+    $relayBody = "Hello,`n`nThis is a test performed by Integrity. If you receive this email, the MX that was tested can be used as a mail relay.`n`nThank you."
+    $r = Invoke-SmtpTest -Key "relay" -Title "Open mail relay test" `
             -MailFrom $InternalEmail -RcptTo $RelayTestEmail `
             -Subject "Integrity Mail Relay Test" -Body $relayBody
     $r.Transcript | ForEach-Object { Write-Host "    $_" }
@@ -228,7 +227,7 @@ if ($RelayTestEmail) {
 }
 
 # --------------------------------------------------------------------
-# Rapport + mail de prevenance (bilingue EN/HE, un seul fichier chacun)
+# Report + log, both in English
 # --------------------------------------------------------------------
 $outDir = Join-Path $PSScriptRoot "dica_mx_reports"
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
@@ -236,30 +235,10 @@ $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $slug = $Domain -replace '\.', '_'
 
 $logPath = Join-Path $outDir "$slug`_$stamp`_log.json"
-$reportPath = Join-Path $outDir "$slug`_$stamp`_rapport.txt"
+$reportPath = Join-Path $outDir "$slug`_$stamp`_report.txt"
 
 $results | Select-Object Key, Title, MailFrom, RcptTo, FinalCode, Verdict, @{N='Transcript';E={$_.Transcript}} |
     ConvertTo-Json -Depth 4 | Set-Content -Path $logPath -Encoding UTF8
-
-# Le rapport client est toujours en anglais (destinataires israeliens,
-# le francais ne sert qu'en interne) -- titres et verdicts retraduits ici,
-# independamment des messages console ci-dessus.
-$englishTitle = @{
-    "unauth" = "Unauthenticated send test"
-    "spoof"  = "Spoofing test"
-    "relay"  = "Open mail relay test"
-}
-
-function Get-EnglishVerdict($r) {
-    if ($null -eq $r.FinalCode) { return "NOT RUN" }
-    if ($r.FinalCode -eq -1) { return "NETWORK ERROR" }
-    if ($r.Key -eq "relay") {
-        if ($r.FinalCode -ge 400) { return "OK - relay refused (code $($r.FinalCode), good sign)" }
-        return "RISK - relay accepted (code $($r.FinalCode))"
-    }
-    if ($r.FinalCode -lt 300) { return "RISK - message accepted (code $($r.FinalCode))" }
-    return "OK - message rejected (code $($r.FinalCode))"
-}
 
 $reportLines = @()
 $reportLines += "Subject: MX Server Test Summary - $Domain - $(Get-Date -Format 'dd/MM/yyyy')"
@@ -268,12 +247,11 @@ $reportLines += "Domain tested: $Domain"
 $reportLines += "MX tested: $MxHost ($MxIp)"
 $reportLines += ""
 foreach ($r in $results) {
-    $title = if ($englishTitle.ContainsKey($r.Key)) { $englishTitle[$r.Key] } else { $r.Title }
-    $reportLines += "--- $title ---"
-    $reportLines += "Result: $(Get-EnglishVerdict $r)"
+    $reportLines += "--- $($r.Title) ---"
+    $reportLines += "Result: $($r.Verdict)"
     $reportLines += ""
 }
 $reportLines -join "`n" | Set-Content -Path $reportPath -Encoding UTF8
 
-Write-Host "[OK] Log JSON      : $logPath" -ForegroundColor Green
-Write-Host "[OK] Rapport client: $reportPath" -ForegroundColor Green
+Write-Host "[OK] JSON log   : $logPath" -ForegroundColor Green
+Write-Host "[OK] Report     : $reportPath" -ForegroundColor Green
