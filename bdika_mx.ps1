@@ -94,8 +94,11 @@ function Get-SpfRecord($LookupDomain) {
         $txts = Resolve-DnsName -Name $LookupDomain -Type TXT -ErrorAction Stop
         $spf = $txts | Where-Object { ($_.Strings -join '') -match '^v=spf1' } | Select-Object -First 1
         if ($spf) { return ($spf.Strings -join '') }
-    } catch { }
-    return $null
+        return $null
+    } catch {
+        if ($_.Exception.Message -match 'does not exist|Non-existent') { return $null }
+        return "(check unavailable: $($_.Exception.Message))"
+    }
 }
 
 function Get-DmarcRecord($LookupDomain) {
@@ -103,8 +106,48 @@ function Get-DmarcRecord($LookupDomain) {
         $txts = Resolve-DnsName -Name "_dmarc.$LookupDomain" -Type TXT -ErrorAction Stop
         $dmarc = $txts | Where-Object { ($_.Strings -join '') -match '^v=DMARC1' } | Select-Object -First 1
         if ($dmarc) { return ($dmarc.Strings -join '') }
-    } catch { }
-    return $null
+        return $null
+    } catch {
+        if ($_.Exception.Message -match 'does not exist|Non-existent') { return $null }
+        return "(check unavailable: $($_.Exception.Message))"
+    }
+}
+
+# Approximate SPF "DNS lookup" count (the include:/a/mx/ptr/exists/redirect
+# mechanisms that each cost one lookup against the RFC 7208 limit of 10).
+# This only counts TOP-LEVEL mechanisms in the record itself -- it does not
+# recursively resolve each include's own lookups, so treat a result close
+# to or over 10 as "worth investigating properly", not as a precise count.
+function Get-SpfLookupCount($SpfRecord) {
+    if (-not $SpfRecord -or $SpfRecord -match '^\(check unavailable') { return $null }
+    $count = 0
+    foreach ($term in ($SpfRecord -split '\s+')) {
+        $t = $term -replace '^[+\-~?]', ''
+        if ($t -match '^(include:|a($|:|/)|mx($|:|/)|ptr($|:)|exists:|redirect=)') { $count++ }
+    }
+    return $count
+}
+
+# --------------------------------------------------------------------
+# MX blacklist check - is the CLIENT's own MX IP listed on a major DNSBL?
+# Independent finding from the active SMTP tests: a blacklisted MX means
+# the client's own outbound/bounce traffic (or a past compromise) is
+# already flagged by other mail providers, regardless of how the SMTP
+# tests below turn out.
+# --------------------------------------------------------------------
+function Test-MxBlacklist($Ip) {
+    $octets = $Ip -split '\.'
+    if ($octets.Count -ne 4) { return @() }
+    $reversed = "$($octets[3]).$($octets[2]).$($octets[1]).$($octets[0])"
+    $zones = @("zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org", "dnsbl.sorbs.org", "psbl.surriel.com", "cbl.abuseat.org")
+    $hits = @()
+    foreach ($zone in $zones) {
+        try {
+            Resolve-DnsName -Name "$reversed.$zone" -Type A -ErrorAction Stop | Out-Null
+            $hits += $zone
+        } catch { }  # NXDOMAIN = not listed on this zone, expected
+    }
+    return $hits
 }
 
 $spoofDomain = ($SpoofFrom -split '@')[-1]
@@ -120,9 +163,54 @@ $spoofDmarc = Get-DmarcRecord $spoofDomain
 Write-Host "  $spoofDomain SPF    : $(if ($spoofSpf) { $spoofSpf } else { '(none found)' })"
 Write-Host "  $spoofDomain DMARC  : $(if ($spoofDmarc) { $spoofDmarc } else { '(none found)' })`n"
 
+$spfLookupCount = Get-SpfLookupCount $clientSpf
+
+Write-Host "--- MX blacklist check ($MxIp) ---" -ForegroundColor Cyan
+$blacklistHits = Test-MxBlacklist $MxIp
+if ($blacklistHits.Count -gt 0) {
+    Write-Host "  LISTED on: $($blacklistHits -join ', ')" -ForegroundColor Red
+} else {
+    Write-Host "  Not listed on any checked DNSBL ($(( @('zen.spamhaus.org','bl.spamcop.net','b.barracudacentral.org','dnsbl.sorbs.org','psbl.surriel.com','cbl.abuseat.org')) -join ', '))"
+}
+Write-Host ""
+
+# --------------------------------------------------------------------
+# Findings collected for the Monday.com import (actionable items only --
+# OK verdicts are not findings, nothing to action on those).
+# --------------------------------------------------------------------
+$findings = @()
+function Add-Finding($Name, $Severity, $Description, $Recommendation) {
+    $script:findings += [PSCustomObject]@{
+        Name = $Name; Severity = $Severity; Description = $Description; Recommendation = $Recommendation
+    }
+}
+
+if ($blacklistHits.Count -gt 0) {
+    Add-Finding "MX IP listed on a DNSBL" "High" `
+        "$MxIp ($MxHost) is listed on: $($blacklistHits -join ', ')." `
+        "Investigate why the client's own MX IP is blacklisted (possible past abuse/compromise) and request delisting once resolved."
+}
+if (-not $clientDmarc) {
+    Add-Finding "No DMARC record on $Domain" "High" `
+        "No DMARC TXT record found at _dmarc.$Domain." `
+        "Publish a DMARC record (start at p=quarantine, move to p=reject once monitored) to prevent impersonation of $Domain."
+} elseif ($clientDmarc -match '^\(check unavailable') {
+    Add-Finding "DMARC check could not be completed for $Domain" "Info" $clientDmarc "Re-run the DNS posture check once connectivity/resolver issues are resolved."
+}
+if (-not $clientSpf) {
+    Add-Finding "No SPF record on $Domain" "Medium" `
+        "No SPF TXT record found for $Domain." `
+        "Publish an SPF record listing all legitimate sending sources for $Domain."
+} elseif ($spfLookupCount -ne $null -and $spfLookupCount -ge 10) {
+    Add-Finding "SPF record near/over the 10-lookup limit" "Medium" `
+        "$Domain SPF has approximately $spfLookupCount top-level DNS-lookup mechanisms (include/a/mx/ptr/exists/redirect); RFC 7208 caps this at 10, beyond which SPF evaluation returns permerror and effectively stops protecting the domain." `
+        "Flatten/reduce the SPF record's includes to stay under the 10-lookup limit."
+}
+
 $dnsPosture = [PSCustomObject]@{
     ClientDomain = $Domain; ClientSpf = $clientSpf; ClientDmarc = $clientDmarc
     SpoofDomain  = $spoofDomain; SpoofSpf = $spoofSpf; SpoofDmarc = $spoofDmarc
+    SpfLookupCount = $spfLookupCount; MxBlacklistHits = $blacklistHits
 }
 
 Write-Host "--- Summary ---"
@@ -271,6 +359,14 @@ if ($RelayTestEmail) {
     $results += $r
 }
 
+foreach ($r in $results) {
+    if ($r.Verdict -like "RISK*") {
+        Add-Finding "$($r.Title) - accepted" "High" `
+            "$($r.Title) was accepted by the MX ($($r.Verdict))." `
+            "Review mail gateway rules to block/quarantine this scenario; see the transcript in the JSON log for the exact SMTP exchange."
+    }
+}
+
 # --------------------------------------------------------------------
 # Report + log, both in English
 # --------------------------------------------------------------------
@@ -281,10 +377,12 @@ $slug = $Domain -replace '\.', '_'
 
 $logPath = Join-Path $outDir "$slug`_$stamp`_log.json"
 $reportPath = Join-Path $outDir "$slug`_$stamp`_report.txt"
+$findingsPath = Join-Path $outDir "$slug`_$stamp`_findings_monday.csv"
 
 [PSCustomObject]@{
     DnsPosture = $dnsPosture
     Tests = ($results | Select-Object Key, Title, MailFrom, RcptTo, FinalCode, Verdict, @{N='Transcript';E={$_.Transcript}})
+    Findings = $findings
 } | ConvertTo-Json -Depth 5 | Set-Content -Path $logPath -Encoding UTF8
 
 $reportLines = @()
@@ -299,6 +397,9 @@ $reportLines += "$Domain DMARC: $(if ($clientDmarc) { $clientDmarc } else { '(no
 $reportLines += "$spoofDomain SPF: $(if ($spoofSpf) { $spoofSpf } else { '(none found)' })"
 $reportLines += "$spoofDomain DMARC: $(if ($spoofDmarc) { $spoofDmarc } else { '(none found)' })"
 $reportLines += ""
+$reportLines += "--- MX blacklist check ($MxIp) ---"
+$reportLines += $(if ($blacklistHits.Count -gt 0) { "LISTED on: $($blacklistHits -join ', ')" } else { "Not listed on any checked DNSBL" })
+$reportLines += ""
 foreach ($r in $results) {
     $reportLines += "--- $($r.Title) ---"
     $reportLines += "Result: $($r.Verdict)"
@@ -306,5 +407,12 @@ foreach ($r in $results) {
 }
 $reportLines -join "`n" | Set-Content -Path $reportPath -Encoding UTF8
 
-Write-Host "[OK] JSON log   : $logPath" -ForegroundColor Green
-Write-Host "[OK] Report     : $reportPath" -ForegroundColor Green
+if ($findings.Count -gt 0) {
+    $findings | Export-Csv -Path $findingsPath -NoTypeInformation -Encoding UTF8
+} else {
+    "Name,Severity,Description,Recommendation" | Set-Content -Path $findingsPath -Encoding UTF8
+}
+
+Write-Host "[OK] JSON log       : $logPath" -ForegroundColor Green
+Write-Host "[OK] Report         : $reportPath" -ForegroundColor Green
+Write-Host "[OK] Findings (Monday import, $($findings.Count) item(s)): $findingsPath" -ForegroundColor Green

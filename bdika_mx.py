@@ -32,7 +32,9 @@ before sending anything.
 """
 
 import argparse
+import csv
 import io
+import re
 import smtplib
 import socket
 import sys
@@ -145,6 +147,54 @@ def check_dns_posture(client_domain, spoof_from):
     print(f"  {spoof_domain} SPF   : {posture['spoof_spf'] or '(none found)'}")
     print(f"  {spoof_domain} DMARC : {posture['spoof_dmarc'] or '(none found)'}\n")
     return posture
+
+
+# Approximate SPF "DNS lookup" count (the include:/a/mx/ptr/exists/redirect
+# mechanisms that each cost one lookup against the RFC 7208 limit of 10).
+# This only counts TOP-LEVEL mechanisms in the record itself -- it does not
+# recursively resolve each include's own lookups, so treat a result close
+# to or over 10 as "worth investigating properly", not as a precise count.
+_SPF_LOOKUP_RE = re.compile(r"^(include:|a($|:|/)|mx($|:|/)|ptr($|:)|exists:|redirect=)")
+
+
+def get_spf_lookup_count(spf_record):
+    if not spf_record or spf_record.startswith("(check unavailable"):
+        return None
+    count = 0
+    for term in spf_record.split():
+        term = term.lstrip("+-~?")
+        if _SPF_LOOKUP_RE.match(term):
+            count += 1
+    return count
+
+
+# --------------------------------------------------------------------------
+# MX blacklist check - is the CLIENT's own MX IP listed on a major DNSBL?
+# Independent finding from the active SMTP tests: a blacklisted MX means
+# the client's own outbound/bounce traffic (or a past compromise) is
+# already flagged by other mail providers, regardless of how the SMTP
+# tests below turn out.
+# --------------------------------------------------------------------------
+
+DNSBL_ZONES = [
+    "zen.spamhaus.org", "bl.spamcop.net", "b.barracudacentral.org",
+    "dnsbl.sorbs.org", "psbl.surriel.com", "cbl.abuseat.org",
+]
+
+
+def check_mx_blacklist(ip):
+    octets = ip.split(".")
+    if len(octets) != 4:
+        return []
+    reversed_ip = ".".join(reversed(octets))
+    hits = []
+    for zone in DNSBL_ZONES:
+        try:
+            socket.gethostbyname(f"{reversed_ip}.{zone}")
+            hits.append(zone)
+        except socket.gaierror:
+            pass  # NXDOMAIN = not listed on this zone, expected
+    return hits
 
 
 # --------------------------------------------------------------------------
@@ -375,6 +425,65 @@ def build_tests(args):
 
 
 # --------------------------------------------------------------------------
+# Findings collected for the Monday.com import (actionable items only --
+# OK verdicts are not findings, nothing to action on those).
+# --------------------------------------------------------------------------
+
+def build_findings(domain, mx_host, mx_ip, posture, spf_lookup_count, blacklist_hits, tests):
+    findings = []
+
+    def add(name, severity, description, recommendation):
+        findings.append({
+            "Name": name, "Severity": severity,
+            "Description": description, "Recommendation": recommendation,
+        })
+
+    if blacklist_hits:
+        add("MX IP listed on a DNSBL", "High",
+            f"{mx_ip} ({mx_host}) is listed on: {', '.join(blacklist_hits)}.",
+            "Investigate why the client's own MX IP is blacklisted (possible "
+            "past abuse/compromise) and request delisting once resolved.")
+
+    client_dmarc = posture["client_dmarc"]
+    if not client_dmarc:
+        add(f"No DMARC record on {domain}", "High",
+            f"No DMARC TXT record found at _dmarc.{domain}.",
+            "Publish a DMARC record (start at p=quarantine, move to "
+            f"p=reject once monitored) to prevent impersonation of {domain}.")
+    elif client_dmarc.startswith("(check unavailable"):
+        add(f"DMARC check could not be completed for {domain}", "Info",
+            client_dmarc,
+            "Re-run the DNS posture check once connectivity/resolver "
+            "issues are resolved.")
+
+    client_spf = posture["client_spf"]
+    if not client_spf:
+        add(f"No SPF record on {domain}", "Medium",
+            f"No SPF TXT record found for {domain}.",
+            f"Publish an SPF record listing all legitimate sending "
+            f"sources for {domain}.")
+    elif spf_lookup_count is not None and spf_lookup_count >= 10:
+        add("SPF record near/over the 10-lookup limit", "Medium",
+            f"{domain} SPF has approximately {spf_lookup_count} top-level "
+            "DNS-lookup mechanisms (include/a/mx/ptr/exists/redirect); "
+            "RFC 7208 caps this at 10, beyond which SPF evaluation "
+            "returns permerror and effectively stops protecting the "
+            "domain.",
+            "Flatten/reduce the SPF record's includes to stay under the "
+            "10-lookup limit.")
+
+    for t in tests:
+        if t.verdict().startswith("RISK"):
+            add(f"{t.title} - accepted", "High",
+                f"{t.title} was accepted by the MX ({t.verdict()}).",
+                "Review mail gateway rules to block/quarantine this "
+                "scenario; see the transcript in the JSON log for the "
+                "exact SMTP exchange.")
+
+    return findings
+
+
+# --------------------------------------------------------------------------
 # Final report + heads-up email, ready to paste
 # --------------------------------------------------------------------------
 
@@ -394,7 +503,7 @@ def render_heads_up_email(domain):
     )
 
 
-def render_report(domain, mx_host, mx_ip, posture, tests):
+def render_report(domain, mx_host, mx_ip, posture, blacklist_hits, tests):
     lines = []
     lines.append(f"Subject: MX Server Test Summary - <Client> - "
                   f"{datetime.date.today():%d/%m/%Y}\n")
@@ -409,6 +518,9 @@ def render_report(domain, mx_host, mx_ip, posture, tests):
     lines.append(f"{posture['client_domain']} DMARC: {posture['client_dmarc'] or '(none found)'}")
     lines.append(f"{posture['spoof_domain']} SPF: {posture['spoof_spf'] or '(none found)'}")
     lines.append(f"{posture['spoof_domain']} DMARC: {posture['spoof_dmarc'] or '(none found)'}\n")
+    lines.append(f"--- MX blacklist check ({mx_ip}) ---")
+    lines.append(f"LISTED on: {', '.join(blacklist_hits)}" if blacklist_hits else "Not listed on any checked DNSBL")
+    lines.append("")
     lines.append("Tests performed:")
     for i, t in enumerate(tests, 1):
         lines.append(f"{i}. {t.title}")
@@ -572,6 +684,16 @@ def main():
 
     # --- DNS posture check (SPF/DMARC) ----------------------------------
     posture = check_dns_posture(args.domain, args.spoof_from)
+    spf_lookup_count = get_spf_lookup_count(posture["client_spf"])
+
+    # --- MX blacklist check ----------------------------------------------
+    print(f"--- MX blacklist check ({mx_ip}) ---")
+    blacklist_hits = check_mx_blacklist(mx_ip)
+    if blacklist_hits:
+        print(f"  LISTED on: {', '.join(blacklist_hits)}")
+    else:
+        print(f"  Not listed on any checked DNSBL ({', '.join(DNSBL_ZONES)})")
+    print()
 
     # --- Tests -----------------------------------------------------------
     tests = build_tests(args)
@@ -582,6 +704,8 @@ def main():
             print(f"    {step:<45} -> {code} {msg.splitlines()[0] if msg else ''}")
         print(f"    => {t.verdict()}\n")
 
+    findings = build_findings(args.domain, mx_host, mx_ip, posture, spf_lookup_count, blacklist_hits, tests)
+
     # --- Output ------------------------------------------------------------
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -591,6 +715,7 @@ def main():
     log_path = out_dir / f"{domain_slug}_{stamp}_log.json"
     report_path = out_dir / f"{domain_slug}_{stamp}_report.txt"
     heads_up_path = out_dir / f"{domain_slug}_{stamp}_heads_up_email.txt"
+    findings_path = out_dir / f"{domain_slug}_{stamp}_findings_monday.csv"
 
     log_data = {
         "domain": args.domain,
@@ -598,6 +723,8 @@ def main():
         "mx_ip": mx_ip,
         "timestamp": stamp,
         "dns_posture": posture,
+        "spf_lookup_count": spf_lookup_count,
+        "mx_blacklist_hits": blacklist_hits,
         "tests": [
             {
                 "key": t.key,
@@ -610,14 +737,21 @@ def main():
             }
             for t in tests
         ],
+        "findings": findings,
     }
     log_path.write_text(json.dumps(log_data, indent=2, ensure_ascii=False), encoding="utf-8")
-    report_path.write_text(render_report(args.domain, mx_host, mx_ip, posture, tests), encoding="utf-8")
+    report_path.write_text(render_report(args.domain, mx_host, mx_ip, posture, blacklist_hits, tests), encoding="utf-8")
     heads_up_path.write_text(render_heads_up_email(args.domain), encoding="utf-8")
+
+    with open(findings_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["Name", "Severity", "Description", "Recommendation"])
+        writer.writeheader()
+        writer.writerows(findings)
 
     print(f"[OK] JSON log       : {log_path}")
     print(f"[OK] Report         : {report_path}")
     print(f"[OK] Heads-up email (send BEFORE starting the tests, for reference): {heads_up_path}")
+    print(f"[OK] Findings (Monday import, {len(findings)} item(s)): {findings_path}")
 
 
 if __name__ == "__main__":
