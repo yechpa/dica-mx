@@ -143,8 +143,13 @@ function Test-MxBlacklist($Ip) {
     $hits = @()
     foreach ($zone in $zones) {
         try {
-            Resolve-DnsName -Name "$reversed.$zone" -Type A -ErrorAction Stop | Out-Null
-            $hits += $zone
+            $answer = Resolve-DnsName -Name "$reversed.$zone" -Type A -ErrorAction Stop | Select-Object -First 1
+            # A genuine DNSBL "listed" response is always an address inside
+            # 127.0.0.0/8 (RFC 5782 convention). Some zones (e.g. a parked/
+            # misconfigured dnsbl.sorbs.org) answer EVERY query with the same
+            # real-looking IP -- that is not a listing, it's a broken/catch-all
+            # zone, and must not be reported as a hit.
+            if ($answer.IPAddress -like "127.*") { $hits += $zone }
         } catch { }  # NXDOMAIN = not listed on this zone, expected
     }
     return $hits

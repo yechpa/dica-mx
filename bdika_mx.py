@@ -190,8 +190,14 @@ def check_mx_blacklist(ip):
     hits = []
     for zone in DNSBL_ZONES:
         try:
-            socket.gethostbyname(f"{reversed_ip}.{zone}")
-            hits.append(zone)
+            answer = socket.gethostbyname(f"{reversed_ip}.{zone}")
+            # A genuine DNSBL "listed" response is always an address inside
+            # 127.0.0.0/8 (RFC 5782 convention). Some zones (e.g. a parked/
+            # misconfigured dnsbl.sorbs.org) answer EVERY query with the
+            # same real-looking IP -- that is not a listing, it's a broken/
+            # catch-all zone, and must not be reported as a hit.
+            if answer.startswith("127."):
+                hits.append(zone)
         except socket.gaierror:
             pass  # NXDOMAIN = not listed on this zone, expected
     return hits
